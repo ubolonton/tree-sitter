@@ -2,7 +2,8 @@ use super::grammars::{ExternalToken, LexicalGrammar, SyntaxGrammar, VariableType
 use super::nfa::CharacterSet;
 use super::rules::{Alias, AliasMap, Symbol, SymbolType};
 use super::tables::{
-    AdvanceAction, FieldLocation, LexState, LexTable, ParseAction, ParseTable, ParseTableEntry,
+    AdvanceAction, FieldLocation, GotoAction, LexState, LexTable, ParseAction, ParseTable,
+    ParseTableEntry,
 };
 use core::ops::Range;
 use hashbrown::{HashMap, HashSet};
@@ -652,7 +653,12 @@ impl Generator {
         add_line!(self, "static TSLexMode ts_lex_modes[STATE_COUNT] = {{");
         indent!(self);
         for (i, state) in self.parse_table.states.iter().enumerate() {
-            if state.external_lex_state_id > 0 {
+            if state.is_non_terminal_extra
+                && state.terminal_entries.len() == 1
+                && *state.terminal_entries.iter().next().unwrap().0 == Symbol::end()
+            {
+                add_line!(self, "[{}] = {{-1}},", i,);
+            } else if state.external_lex_state_id > 0 {
                 add_line!(
                     self,
                     "[{}] = {{.lex_state = {}, .external_lex_state = {}}},",
@@ -762,12 +768,15 @@ impl Generator {
         {
             add_line!(self, "[{}] = {{", i);
             indent!(self);
-            for (symbol, state_id) in &state.nonterminal_entries {
+            for (symbol, action) in &state.nonterminal_entries {
                 add_line!(
                     self,
                     "[{}] = STATE({}),",
                     self.symbol_ids[symbol],
-                    *state_id
+                    match action {
+                        GotoAction::Goto(state) => *state,
+                        GotoAction::ShiftExtra => i,
+                    }
                 );
             }
             for (symbol, entry) in &state.terminal_entries {
@@ -811,7 +820,13 @@ impl Generator {
             index = 0;
             add_line!(self, "static uint16_t ts_small_parse_table[] = {{");
             indent!(self);
-            for state in self.parse_table.states.iter().skip(self.large_state_count) {
+            for (i, state) in self
+                .parse_table
+                .states
+                .iter()
+                .enumerate()
+                .skip(self.large_state_count)
+            {
                 add_line!(self, "[{}] = {},", index, state.symbol_count());
                 indent!(self);
 
@@ -829,8 +844,16 @@ impl Generator {
                     add_line!(self, "{}, ACTIONS({}),", self.symbol_ids[symbol], entry_id);
                 }
 
-                for (symbol, state_id) in &nonterminal_entries {
-                    add_line!(self, "{}, STATE({}),", self.symbol_ids[symbol], *state_id);
+                for (symbol, action) in &nonterminal_entries {
+                    add_line!(
+                        self,
+                        "{}, STATE({}),",
+                        self.symbol_ids[symbol],
+                        match action {
+                            GotoAction::Goto(state) => *state,
+                            GotoAction::ShiftExtra => i,
+                        }
+                    );
                 }
                 dedent!(self);
 

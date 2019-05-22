@@ -2,7 +2,7 @@ use super::item::TokenSet;
 use super::token_conflicts::TokenConflictMap;
 use crate::generate::grammars::{LexicalGrammar, SyntaxGrammar, VariableType};
 use crate::generate::rules::{AliasMap, Symbol};
-use crate::generate::tables::{ParseAction, ParseState, ParseTable, ParseTableEntry};
+use crate::generate::tables::{GotoAction, ParseAction, ParseState, ParseTable, ParseTableEntry};
 use hashbrown::{HashMap, HashSet};
 use log::info;
 use std::{fmt, mem};
@@ -102,7 +102,10 @@ impl<'a> Minimizer<'a> {
                 state.update_referenced_states(|other_state_id, state| {
                     if let Some(symbol) = unit_reduction_symbols_by_state.get(&other_state_id) {
                         done = false;
-                        state.nonterminal_entries[symbol]
+                        match state.nonterminal_entries.get(symbol) {
+                            Some(GotoAction::Goto(state_id)) => *state_id,
+                            _ => other_state_id,
+                        }
                     } else {
                         other_state_id
                     }

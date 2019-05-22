@@ -312,6 +312,7 @@ static Subtree ts_parser__lex(TSParser *self, StackVersion version, TSStateId pa
   Length start_position = ts_stack_position(self->stack, version);
   Subtree external_token = ts_stack_last_external_token(self->stack, version);
   TSLexMode lex_mode = self->language->lex_modes[parse_state];
+  if (lex_mode.lex_state == (uint16_t)-1) return NULL_SUBTREE;
   const bool *valid_external_tokens = ts_language_enabled_external_tokens(
     self->language,
     lex_mode.external_lex_state
@@ -745,7 +746,9 @@ static StackVersion ts_parser__reduce(TSParser *self, StackVersion version, TSSy
 
     TSStateId state = ts_stack_state(self->stack, slice_version);
     TSStateId next_state = ts_language_next_state(self->language, state, symbol);
-    if (fragile || pop.size > 1 || initial_version_count > 1) {
+    if (next_state == state) {
+      parent.ptr->extra = true;
+    } else if (fragile || pop.size > 1 || initial_version_count > 1) {
       parent.ptr->fragile_left = true;
       parent.ptr->fragile_right = true;
       parent.ptr->parse_state = TS_TREE_STATE_NONE;
@@ -1279,8 +1282,17 @@ static bool ts_parser__advance(
   // Otherwise, re-run the lexer.
   if (!lookahead.ptr) {
     lookahead = ts_parser__lex(self, version, state);
-    ts_parser__set_cached_token(self, position, last_external_token, lookahead);
-    ts_language_table_entry(self->language, state, ts_subtree_symbol(lookahead), &table_entry);
+    if (lookahead.ptr) {
+      ts_parser__set_cached_token(self, position, last_external_token, lookahead);
+      ts_language_table_entry(self->language, state, ts_subtree_symbol(lookahead), &table_entry);
+    }
+
+    // When parsing a non-terminal extra, a null lookahead indicates the
+    // end of the rule. The reduction is stored in the EOF table entry.
+    // After the reduction, the lexer needs to be run again.
+    else {
+      ts_language_table_entry(self->language, state, ts_builtin_sym_end, &table_entry);
+    }
   }
 
   for (;;) {
@@ -1362,6 +1374,9 @@ static bool ts_parser__advance(
       ts_stack_renumber_version(self->stack, last_reduction_version, version);
       LOG_STACK();
       state = ts_stack_state(self->stack, version);
+      if (!lookahead.ptr) {
+        lookahead = ts_parser__lex(self, version, state);
+      }
       ts_language_table_entry(
         self->language,
         state,

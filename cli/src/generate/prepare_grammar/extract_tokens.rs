@@ -93,15 +93,7 @@ pub(super) fn extract_tokens(
     let mut extra_tokens = Vec::new();
     for rule in grammar.extra_tokens {
         if let Rule::Symbol(symbol) = rule {
-            let new_symbol = symbol_replacer.replace_symbol(symbol);
-            if new_symbol.is_non_terminal() {
-                return Err(Error(format!(
-                    "Non-token symbol '{}' cannot be used as an extra token",
-                    &variables[new_symbol.index].name
-                )));
-            } else {
-                extra_tokens.push(new_symbol);
-            }
+            extra_tokens.push(symbol_replacer.replace_symbol(symbol));
         } else {
             if let Some(index) = lexical_variables.iter().position(|v| v.rule == rule) {
                 extra_tokens.push(Symbol::terminal(index));
