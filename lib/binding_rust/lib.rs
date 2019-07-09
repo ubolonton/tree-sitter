@@ -197,6 +197,11 @@ unsafe impl Send for Language {}
 
 unsafe impl Sync for Language {}
 
+struct WrappedInput<T: FnMut(usize, Point) -> String> {
+    buffers: Vec<String>,
+    input: T,
+}
+
 impl Parser {
     pub fn new() -> Parser {
         unsafe {
@@ -324,6 +329,43 @@ impl Parser {
 
         let c_input = ffi::TSInput {
             payload: input as *mut T as *mut c_void,
+            read: Some(read::<T>),
+            encoding: ffi::TSInputEncoding_TSInputEncodingUTF8,
+        };
+
+        let c_old_tree = old_tree.map_or(ptr::null_mut(), |t| t.0);
+        let c_new_tree = unsafe { ffi::ts_parser_parse(self.0, c_old_tree, c_input) };
+        if c_new_tree.is_null() {
+            None
+        } else {
+            Some(Tree(c_new_tree))
+        }
+    }
+
+    pub fn parse_owned_with<T: FnMut(usize, Point) -> String>(
+        &mut self,
+        input: T,
+        old_tree: Option<&Tree>,
+    ) -> Option<Tree> {
+        unsafe extern "C" fn read<T: FnMut(usize, Point) -> String>(
+            payload: *mut c_void,
+            byte_offset: u32,
+            position: ffi::TSPoint,
+            bytes_read: *mut u32,
+        ) -> *const c_char {
+            let wrapped_input = (payload as *mut WrappedInput<T>).as_mut().unwrap();
+            let input = &mut wrapped_input.input;
+            let buffer = input(byte_offset as usize, position.into());
+            let slice = buffer.as_bytes();
+            *bytes_read = slice.len() as u32;
+            let ptr = slice.as_ptr() as *const c_char;
+            wrapped_input.buffers.push(buffer);
+            return ptr;
+        };
+
+        let mut wrapped_input = WrappedInput { buffers: vec![], input };
+        let c_input = ffi::TSInput {
+            payload: &mut wrapped_input as *mut WrappedInput<T> as *mut c_void,
             read: Some(read::<T>),
             encoding: ffi::TSInputEncoding_TSInputEncodingUTF8,
         };
