@@ -166,9 +166,57 @@ unsafe impl Send for Language {}
 
 unsafe impl Sync for Language {}
 
-struct WrappedInput<T: FnMut(usize, Point) -> String> {
-    buffers: Vec<String>,
+pub trait Input: Sized {
+    unsafe extern "C" fn c_read(
+        payload: *mut c_void,
+        byte_offset: u32,
+        position: ffi::TSPoint,
+        bytes_read: *mut u32,
+    ) -> *const c_char {
+        let wrapped = Self::from_payload(payload).as_mut().unwrap();
+        let slice = wrapped.read(byte_offset as usize, position.into());
+        *bytes_read = slice.len() as u32;
+        slice.as_ptr() as *const c_char
+    }
+
+    fn to_payload(&mut self) -> *mut c_void {
+        self as *mut Self as *mut c_void
+    }
+
+    unsafe fn from_payload(payload: *mut c_void) -> *mut Self {
+        payload as *mut Self
+    }
+
+    fn read(&mut self, byte: usize, point: Point) -> &[u8];
+}
+
+struct Borrowing<'a, T: FnMut(usize, Point) -> &'a [u8]> {
     input: T,
+}
+
+struct Buffering<T, S> {
+    buffers: Vec<S>,
+    input: T,
+}
+
+impl<T, S> Buffering<T, S> {
+    fn new(input: T) -> Self {
+        Self { input, buffers: vec![] }
+    }
+}
+
+impl<T: FnMut(usize, Point) -> S, S: AsRef<[u8]>> Input for Buffering<T, S> {
+    fn read(&mut self, byte: usize, point: Point) -> &[u8] {
+        let buffer = (&mut self.input)(byte, point);
+        self.buffers.push(buffer);
+        self.buffers.last().unwrap().as_ref()
+    }
+}
+
+impl<'a, T: FnMut(usize, Point) -> &'a [u8]> Input for Borrowing<'a, T> {
+    fn read(&mut self, byte: usize, point: Point) -> &[u8] {
+        (&mut self.input)(byte, point)
+    }
 }
 
 impl Parser {
@@ -285,58 +333,25 @@ impl Parser {
         input: &mut T,
         old_tree: Option<&Tree>,
     ) -> Option<Tree> {
-        unsafe extern "C" fn read<'a, T: FnMut(usize, Point) -> &'a [u8]>(
-            payload: *mut c_void,
-            byte_offset: u32,
-            position: ffi::TSPoint,
-            bytes_read: *mut u32,
-        ) -> *const c_char {
-            let input = (payload as *mut T).as_mut().unwrap();
-            let slice = input(byte_offset as usize, position.into());
-            *bytes_read = slice.len() as u32;
-            return slice.as_ptr() as *const c_char;
-        };
-
-        let c_input = ffi::TSInput {
-            payload: input as *mut T as *mut c_void,
-            read: Some(read::<T>),
-            encoding: ffi::TSInputEncoding_TSInputEncodingUTF8,
-        };
-
-        let c_old_tree = old_tree.map_or(ptr::null_mut(), |t| t.0);
-        let c_new_tree = unsafe { ffi::ts_parser_parse(self.0, c_old_tree, c_input) };
-        if c_new_tree.is_null() {
-            None
-        } else {
-            Some(Tree(c_new_tree))
-        }
+        self.parse_custom(&mut Borrowing { input }, old_tree)
     }
 
-    pub fn parse_owned_with<T: FnMut(usize, Point) -> String>(
+    pub fn parse_buffering_with<T: FnMut(usize, Point) -> S, S: AsRef<[u8]>>(
         &mut self,
         input: T,
         old_tree: Option<&Tree>,
     ) -> Option<Tree> {
-        unsafe extern "C" fn read<T: FnMut(usize, Point) -> String>(
-            payload: *mut c_void,
-            byte_offset: u32,
-            position: ffi::TSPoint,
-            bytes_read: *mut u32,
-        ) -> *const c_char {
-            let wrapped_input = (payload as *mut WrappedInput<T>).as_mut().unwrap();
-            let input = &mut wrapped_input.input;
-            let buffer = input(byte_offset as usize, position.into());
-            let slice = buffer.as_bytes();
-            *bytes_read = slice.len() as u32;
-            let ptr = slice.as_ptr() as *const c_char;
-            wrapped_input.buffers.push(buffer);
-            return ptr;
-        };
+        self.parse_custom(&mut Buffering::new(input), old_tree)
+    }
 
-        let mut wrapped_input = WrappedInput { buffers: vec![], input };
+    pub fn parse_custom<T: Input>(
+        &mut self,
+        input: &mut T,
+        old_tree: Option<&Tree>,
+    ) -> Option<Tree> {
         let c_input = ffi::TSInput {
-            payload: &mut wrapped_input as *mut WrappedInput<T> as *mut c_void,
-            read: Some(read::<T>),
+            payload: input.to_payload(),
+            read: Some(T::c_read),
             encoding: ffi::TSInputEncoding_TSInputEncodingUTF8,
         };
 
