@@ -1,5 +1,6 @@
 mod ffi;
 mod util;
+mod input;
 
 #[macro_use]
 extern crate serde_derive;
@@ -18,6 +19,9 @@ use std::marker::PhantomData;
 use std::os::raw::{c_char, c_void};
 use std::sync::atomic::AtomicUsize;
 use std::{fmt, ptr, str, u16};
+
+use self::input::{raw_input, raw_utf16_input, Borrowing, Cloning, Input};
+use ffi::TSInput;
 
 pub const LANGUAGE_VERSION: usize = ffi::TREE_SITTER_LANGUAGE_VERSION;
 pub const PARSER_HEADER: &'static str = include_str!("../include/tree_sitter/parser.h");
@@ -198,59 +202,6 @@ unsafe impl Send for Language {}
 
 unsafe impl Sync for Language {}
 
-pub trait Input: Sized {
-    unsafe extern "C" fn c_read(
-        payload: *mut c_void,
-        byte_offset: u32,
-        position: ffi::TSPoint,
-        bytes_read: *mut u32,
-    ) -> *const c_char {
-        let wrapped = Self::from_payload(payload).as_mut().unwrap();
-        let slice = wrapped.read(byte_offset as usize, position.into());
-        *bytes_read = slice.len() as u32;
-        slice.as_ptr() as *const c_char
-    }
-
-    fn to_payload(&mut self) -> *mut c_void {
-        self as *mut Self as *mut c_void
-    }
-
-    unsafe fn from_payload(payload: *mut c_void) -> *mut Self {
-        payload as *mut Self
-    }
-
-    fn read(&mut self, byte: usize, point: Point) -> &[u8];
-}
-
-struct Borrowing<'a, T: FnMut(usize, Point) -> &'a [u8]> {
-    input: T,
-}
-
-struct Buffering<T, S> {
-    buffers: Vec<S>,
-    input: T,
-}
-
-impl<T, S> Buffering<T, S> {
-    fn new(input: T) -> Self {
-        Self { input, buffers: vec![] }
-    }
-}
-
-impl<T: FnMut(usize, Point) -> S, S: AsRef<[u8]>> Input for Buffering<T, S> {
-    fn read(&mut self, byte: usize, point: Point) -> &[u8] {
-        let buffer = (&mut self.input)(byte, point);
-        self.buffers.push(buffer);
-        self.buffers.last().unwrap().as_ref()
-    }
-}
-
-impl<'a, T: FnMut(usize, Point) -> &'a [u8]> Input for Borrowing<'a, T> {
-    fn read(&mut self, byte: usize, point: Point) -> &[u8] {
-        (&mut self.input)(byte, point)
-    }
-}
-
 impl Parser {
     pub fn new() -> Parser {
         unsafe {
@@ -346,6 +297,26 @@ impl Parser {
         )
     }
 
+    pub fn parse_with<'a, T: FnMut(usize, Point) -> &'a [u8]>(
+        &mut self,
+        input: &mut T,
+        old_tree: Option<&Tree>,
+    ) -> Option<Tree> {
+        self.parse_custom(&mut Borrowing::new(input), old_tree)
+    }
+
+    pub fn parse_cloning_with<T: FnMut(usize, Point) -> S, S: AsRef<[u8]>>(
+        &mut self,
+        input: T,
+        old_tree: Option<&Tree>,
+    ) -> Option<Tree> {
+        self.parse_custom(&mut Cloning::new(input), old_tree)
+    }
+
+    fn parse_custom<T: Input<u8>>(&mut self, input: &mut T, old_tree: Option<&Tree>) -> Option<Tree> {
+        unsafe { self.parse_c_input(raw_input(input), old_tree) }
+    }
+
     pub fn parse_utf16(
         &mut self,
         input: impl AsRef<[u16]>,
@@ -359,73 +330,22 @@ impl Parser {
         )
     }
 
-    pub fn parse_with<'a, T: FnMut(usize, Point) -> &'a [u8]>(
-        &mut self,
-        input: &mut T,
-        old_tree: Option<&Tree>,
-    ) -> Option<Tree> {
-        self.parse_custom(&mut Borrowing { input }, old_tree)
-    }
-
-    pub fn parse_buffering_with<T: FnMut(usize, Point) -> S, S: AsRef<[u8]>>(
-        &mut self,
-        input: T,
-        old_tree: Option<&Tree>,
-    ) -> Option<Tree> {
-        self.parse_custom(&mut Buffering::new(input), old_tree)
-    }
-
-    pub fn parse_custom<T: Input>(
-        &mut self,
-        input: &mut T,
-        old_tree: Option<&Tree>,
-    ) -> Option<Tree> {
-        let c_input = ffi::TSInput {
-            payload: input.to_payload(),
-            read: Some(T::c_read),
-            encoding: ffi::TSInputEncoding_TSInputEncodingUTF8,
-        };
-
-        let c_old_tree = old_tree.map_or(ptr::null_mut(), |t| t.0);
-        let c_new_tree = unsafe { ffi::ts_parser_parse(self.0, c_old_tree, c_input) };
-        if c_new_tree.is_null() {
-            None
-        } else {
-            Some(Tree(c_new_tree))
-        }
-    }
-
     pub fn parse_utf16_with<'a, T: 'a + FnMut(usize, Point) -> &'a [u16]>(
         &mut self,
         input: &mut T,
         old_tree: Option<&Tree>,
     ) -> Option<Tree> {
-        unsafe extern "C" fn read<'a, T: FnMut(usize, Point) -> &'a [u16]>(
-            payload: *mut c_void,
-            byte_offset: u32,
-            position: ffi::TSPoint,
-            bytes_read: *mut u32,
-        ) -> *const c_char {
-            let input = (payload as *mut T).as_mut().unwrap();
-            let slice = input(
-                (byte_offset / 2) as usize,
-                Point {
-                    row: position.row as usize,
-                    column: position.column as usize / 2,
-                },
-            );
-            *bytes_read = slice.len() as u32 * 2;
-            slice.as_ptr() as *const c_char
-        };
+        self.parse_utf16_custom(&mut Borrowing::new(input), old_tree)
+    }
 
-        let c_input = ffi::TSInput {
-            payload: input as *mut T as *mut c_void,
-            read: Some(read::<T>),
-            encoding: ffi::TSInputEncoding_TSInputEncodingUTF16,
-        };
+    fn parse_utf16_custom<T: Input<u16>>(&mut self, input: &mut T, old_tree: Option<&Tree>) -> Option<Tree> {
+        unsafe { self.parse_c_input(raw_utf16_input(input), old_tree) }
+    }
 
+    // Safety: c_input's pointers must still be valid.
+    unsafe fn parse_c_input(&mut self, c_input: TSInput, old_tree: Option<&Tree>) -> Option<Tree> {
         let c_old_tree = old_tree.map_or(ptr::null_mut(), |t| t.0);
-        let c_new_tree = unsafe { ffi::ts_parser_parse(self.0, c_old_tree, c_input) };
+        let c_new_tree = ffi::ts_parser_parse(self.0, c_old_tree, c_input);
         if c_new_tree.is_null() {
             None
         } else {
